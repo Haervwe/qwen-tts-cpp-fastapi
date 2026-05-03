@@ -10,6 +10,7 @@ import io
 from pathlib import Path
 from typing import Optional, List, Dict
 
+from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
@@ -17,16 +18,21 @@ from starlette.background import BackgroundTask
 
 app = FastAPI(title="Qwen3-TTS OpenAI-Compatible API")
 
-MODELS_BASE_DIR = Path("/mnt/data/models_storage/TTS/base")
-VOICES_DIR = Path("/mnt/data/models_storage/TTS/voices")
+# Load environment variables
+load_dotenv()
+
+BASE_DIR = Path(__file__).parent
+
+MODELS_BASE_DIR = Path(os.getenv("MODELS_BASE_DIR", str(BASE_DIR / "models")))
+VOICES_DIR = Path(os.getenv("VOICES_DIR", str(BASE_DIR / "voices")))
 EMBED_CACHE_DIR = VOICES_DIR / ".cache"
-CLI_PATH = Path("/home/haervwe/LLMS/qwen-tts/build/qwen3-tts.cpp/qwen3-tts-cli")
+CLI_PATH = Path(os.getenv("CLI_PATH", str(BASE_DIR / "build/qwen3-tts.cpp/qwen3-tts-cli")))
 
 # Ensure cache directory exists
 EMBED_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 # Default model if not specified
-DEFAULT_MODEL = "qwen3-tts-0.6b-f16.gguf"
+DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "qwen3-tts-0.6b-f16.gguf")
 
 # Cache for model info and speakers
 _model_cache = {}
@@ -74,7 +80,7 @@ class SpeechRequest(BaseModel):
     extra_body: Optional[dict] = {}
 
 # Load presets from presets.json
-PRESETS_FILE = Path("/home/haervwe/LLMS/qwen-tts/presets.json")
+PRESETS_FILE = Path(os.getenv("PRESETS_FILE", str(BASE_DIR / "presets.json")))
 
 def load_presets():
     if PRESETS_FILE.exists():
