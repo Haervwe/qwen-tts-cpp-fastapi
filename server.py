@@ -38,23 +38,32 @@ def get_model_capabilities(model_name: str):
     if model_name in _model_cache:
         return _model_cache[model_name]
     
-    cmd = [
-        str(CLI_PATH),
-        "-m", str(MODELS_BASE_DIR),
-        "--model-name", model_name,
-        "--info"
-    ]
+    info = {"speakers": [], "model_type": "base", "supports_voice_clone": False}
+    
+    # Get basic info
+    cmd_info = [str(CLI_PATH), "-m", str(MODELS_BASE_DIR), "--model-name", model_name, "--info"]
     try:
-        res = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+        res = subprocess.run(cmd_info, capture_output=True, text=True, timeout=10)
         output = res.stdout
         start = output.find("{")
         if start != -1:
-            info = json.loads(output[start:])
-            _model_cache[model_name] = info
-            return info
+            info.update(json.loads(output[start:]))
     except Exception as e:
         print(f"Error getting model info: {e}")
-    return None
+
+    # Get speakers list
+    cmd_speakers = [str(CLI_PATH), "-m", str(MODELS_BASE_DIR), "--model-name", model_name, "--list-speakers"]
+    try:
+        res = subprocess.run(cmd_speakers, capture_output=True, text=True, timeout=10)
+        output = res.stdout
+        start = output.find("[")
+        if start != -1:
+            info["speakers"] = json.loads(output[start:])
+    except Exception as e:
+        print(f"Error getting speakers list: {e}")
+        
+    _model_cache[model_name] = info
+    return info
 
 class SpeechRequest(BaseModel):
     model: Optional[str] = None
@@ -66,34 +75,102 @@ class SpeechRequest(BaseModel):
 
 # Load presets from presets.json
 PRESETS_FILE = Path("/home/haervwe/LLMS/qwen-tts/presets.json")
-presets = {}
-if PRESETS_FILE.exists():
-    with open(PRESETS_FILE, "r") as f:
-        presets = json.load(f)
+
+def load_presets():
+    if PRESETS_FILE.exists():
+        try:
+            with open(PRESETS_FILE, "r") as f:
+                return json.load(f)
+        except Exception as e:
+            print(f"Error loading presets: {e}")
+    return {}
 
 @app.get("/v1/models")
 async def list_models():
-    models = []
+    models_data = []
+    # Add actual model files
     for f in MODELS_BASE_DIR.glob("*.gguf"):
-        models.append({
+        models_data.append({
             "id": f.name,
             "object": "model",
             "created": int(f.stat().st_mtime),
             "owned_by": "qwen"
         })
-    return {"object": "list", "data": models}
+    
+    # Also add voices as models for better integration with generic clients
+    voices_resp = await list_voices()
+    for v in voices_resp.get("data", []):
+        models_data.append({
+            "id": v["id"],
+            "object": "model",
+            "created": 1600000000,
+            "owned_by": "system"
+        })
+        
+    return {"object": "list", "data": models_data}
 
+@app.get("/v1/audio/voices")
 @app.get("/v1/voices")
-async def list_voices():
-    # Return a flat list of names for llama-swap compatibility
+async def list_voices(model: Optional[str] = None):
+    # Reload presets to catch changes
+    current_presets = load_presets()
+            
+    # Gather all available voices
     voice_files = [f.stem for f in VOICES_DIR.glob("*.wav")]
-    preset_names = list(presets.keys())
+    preset_names = list(current_presets.keys())
     
-    # Also include internal speakers for the default model
-    info = get_model_capabilities(DEFAULT_MODEL)
+    # Also include internal speakers for the requested model or default
+    target_model = model or DEFAULT_MODEL
+    info = get_model_capabilities(target_model)
     internal_speakers = info.get("speakers", []) if info else []
+    model_type = info.get("model_type", "base") if info else "base"
     
-    return sorted(list(set(voice_files + preset_names + internal_speakers)))
+    # Return structured data
+    voices_data = []
+    
+    # 1. Internal speakers
+    for name in internal_speakers:
+        voices_data.append({
+            "id": name,
+            "voice_id": name,
+            "name": name.title(),
+            "label": name.title(),
+            "value": name,
+            "category": "internal"
+        })
+        
+    # 2. Presets
+    for name in preset_names:
+        voices_data.append({
+            "id": name,
+            "voice_id": name,
+            "name": name.replace('_', ' ').title(),
+            "label": name.replace('_', ' ').title(),
+            "value": name,
+            "category": "preset"
+        })
+
+    # 3. WAV Clones (ONLY for base models)
+    if model_type == "base":
+        for name in voice_files:
+            if name not in internal_speakers and name not in preset_names:
+                voices_data.append({
+                    "id": name,
+                    "voice_id": name,
+                    "name": name.replace('_', ' ').title(),
+                    "label": name.replace('_', ' ').title(),
+                    "value": name,
+                    "category": "cloned"
+                })
+    
+    # Returning a dictionary with both 'voices' (strings) and 'data' (objects) 
+    # covers most UI implementations (OpenWebUI, ElevenLabs-style, etc.)
+    # and should resolve '[object Object]' rendering issues.
+    return {
+        "voices": [v["id"] for v in voices_data],
+        "data": voices_data,
+        "object": "list"
+    }
 
 def get_file_sha256(file_path: Path):
     sha256_hash = hashlib.sha256()
@@ -247,8 +324,9 @@ async def create_speech(req: SpeechRequest):
     instruction = req.extra_body.get("instruction") if req.extra_body else None
 
     info = get_model_capabilities(model_name)
-    if voice_name in presets:
-        preset = presets[voice_name]
+    current_presets = load_presets()
+    if voice_name in current_presets:
+        preset = current_presets[voice_name]
         voice_name = preset.get("voice", voice_name)
         if not instruction:
             instruction = preset.get("instruction")
@@ -268,8 +346,11 @@ async def create_speech(req: SpeechRequest):
     if info and voice_name in info.get("speakers", []):
         speaker = voice_name
     else:
+        # Voice cloning is ONLY for base models
+        model_type = info.get("model_type", "base")
         reference_wav = VOICES_DIR / f"{voice_name}.wav"
-        if reference_wav.exists() and info and info.get("supports_voice_clone"):
+        
+        if model_type == "base" and reference_wav.exists() and info.get("supports_voice_clone"):
             wav_hash = get_file_sha256(reference_wav)
             # Use full model name to differentiate dimensions (0.6b vs 1.7b)
             embed_cache_path = EMBED_CACHE_DIR / f"{voice_name}_{model_name}_{wav_hash}.json"
@@ -279,13 +360,14 @@ async def create_speech(req: SpeechRequest):
             else:
                 # Extract embedding once for the first chunk and save to cache
                 print(f"Extracting new embedding for {voice_name} using {model_name}...")
-                # We'll use the first chunk to trigger the dump
                 reference = str(reference_wav)
-                # But we'll also tell the synthesize call to dump it to the cache path
-                # I'll update synthesize to handle 'dump_embedding'
                 embedding = str(embed_cache_path) 
         else:
-            if info and info.get("supports_named_speakers") and info.get("speakers"):
+            # Fallback for non-base models or missing WAVs
+            if info and info.get("speakers"):
+                # Use the first available internal speaker as fallback
+                speaker = info.get("speakers")[0]
+            else:
                 speaker = "vivian"
 
     temp_wavs = []
