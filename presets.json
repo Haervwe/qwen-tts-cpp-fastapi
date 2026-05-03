@@ -1,0 +1,34 @@
+{
+  "vivian-whisper": {
+    "voice": "vivian",
+    "instruction": "Whispering, very soft and intimate, speaking slowly and quietly."
+  },
+  "ryan-aggressive": {
+    "voice": "ryan",
+    "instruction": "Very angry, shouting, aggressive tone with fast pacing."
+  },
+  "serena-cheerful": {
+    "voice": "serena",
+    "instruction": "Extremely happy, energetic, high-pitched and cheerful, speaking excitedly."
+  },
+  "dylan-sad": {
+    "voice": "dylan",
+    "instruction": "Crying, very sad, sobbing tone, speaking slowly with a trembling voice."
+  },
+  "aiden-news": {
+    "voice": "aiden",
+    "instruction": "Formal, professional news anchor style, clear articulation and moderate pacing."
+  },
+  "sohee-gentle": {
+    "voice": "sohee",
+    "instruction": "Gentle, soothing, calm and peaceful speaking style."
+  },
+  "uncle_fu-old": {
+    "voice": "uncle_fu",
+    "instruction": "Wise, old man voice, slightly gravelly, speaking slowly with authority."
+  },
+  "marta-standard": {
+    "voice": "marta",
+    "instruction": "Natural, conversational tone, standard pace and friendly inflection."
+  }
+}

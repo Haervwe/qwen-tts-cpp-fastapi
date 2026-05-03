@@ -1,0 +1,58 @@
+# Build and Binary artifacts
+build/
+bin/
+lib/
+*.o
+*.so
+*.a
+*.dylib
+*.exe
+*.out
+
+# Python environment and cache
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.coverage
+htmlcov/
+*.egg-info/
+dist/
+wheels/
+
+# Large Model Files
+*.gguf
+/mnt/data/models_storage/
+
+# Local configuration and presets
+.env
+.env.local
+config.local.json
+
+# Audio Output and Temporary Files (Generated)
+*.wav
+*.mp3
+/tmp/chunk_*
+/tmp/final_*
+outputs/
+
+# Speaker Embedding Cache (Privacy)
+.cache/
+.chunks/
+voices/.cache/
+
+# IDE and OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+
+# Subdirectory specific
+qwen3-tts.cpp/build/
+qwen3-tts.cpp/bin/
