@@ -210,43 +210,123 @@ managers: Dict[str, 'ModelManager'] = {}
 manager_lock = asyncio.Lock()
 
 class ModelManager:
+    """Manages a persistent TTS daemon process with pipelined request handling.
+    
+    Architecture: A background _response_reader task continuously reads DONE/ERROR
+    from the daemon's stdout and dispatches them to callers via a FIFO queue of
+    asyncio Futures. The _write_lock is held only during the brief stdin write
+    (microseconds), NOT for the entire synthesis duration. This allows multiple
+    HTTP requests to have commands "in flight" simultaneously — the daemon's stdin
+    buffer queues them and processes back-to-back with zero GPU idle gap.
+    
+    Before (old lock-based):
+        HTTP-A: [acquire lock] [write cmd] [GPU works 2s] [read DONE] [release lock]
+        HTTP-B:                                                        [acquire lock] [write cmd] [GPU works 2s] ...
+                                                          ^^^^^^^^^^^^
+                                                          GPU IDLE (lock contention + IPC)
+    
+    After (queue-based):
+        HTTP-A: [write cmd] --------- [await future → resolved when DONE read] 
+        HTTP-B:   [write cmd] ------- [await future → resolved when DONE read]
+        Daemon: [process A] [process B]  ← back-to-back, zero idle gap
+    """
     def __init__(self, model_name: str):
         self.model_name = model_name
         self.proc = None
-        self.lock = asyncio.Lock()
-        self.stderr_task = None
+        self._startup_lock = asyncio.Lock()  # Serializes daemon start/restart
+        self._write_lock = asyncio.Lock()    # Serializes stdin writes (held briefly)
+        self._pending: asyncio.Queue = asyncio.Queue()  # FIFO of Futures awaiting responses
+        self._reader_task = None
+        self._stderr_task = None
 
     async def start(self):
-        if self.proc and self.proc.returncode is None:
-            return
+        async with self._startup_lock:
+            if self.proc and self.proc.returncode is None:
+                return
 
-        info = get_model_capabilities(self.model_name)
-        model_path = info.get("path", str(MODELS_BASE_DIR))
-        model_file = info.get("model_name", self.model_name)
-        
-        cmd = [
-            str(CLI_PATH),
-            "-m", model_path,
-            "--model-name", model_file,
-            "--daemon"
-        ]
-        
-        print(f"Starting model daemon: {' '.join(cmd)}")
-        self.proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
-        )
-        
-        # Wait for READY
-        line = await self.proc.stdout.readline()
-        if b"READY" not in line:
-            stderr_err = await self.proc.stderr.read(1024)
-            raise Exception(f"Model failed to start: {line.decode().strip()} - {stderr_err.decode()}")
+            # Cancel old tasks if restarting
+            if self._reader_task and not self._reader_task.done():
+                self._reader_task.cancel()
+            if self._stderr_task and not self._stderr_task.done():
+                self._stderr_task.cancel()
+
+            info = get_model_capabilities(self.model_name)
+            model_path = info.get("path", str(MODELS_BASE_DIR))
+            model_file = info.get("model_name", self.model_name)
             
-        print(f"Model {self.model_name} is READY")
-        self.stderr_task = asyncio.create_task(self._log_stderr())
+            cmd = [
+                str(CLI_PATH),
+                "-m", model_path,
+                "--model-name", model_file,
+                "--daemon"
+            ]
+            
+            print(f"Starting model daemon: {' '.join(cmd)}")
+            self.proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            
+            # Wait for READY
+            line = await self.proc.stdout.readline()
+            if b"READY" not in line:
+                stderr_err = await self.proc.stderr.read(1024)
+                raise Exception(f"Model failed to start: {line.decode().strip()} - {stderr_err.decode()}")
+                
+            print(f"Model {self.model_name} is READY")
+            
+            # Start background tasks for reading responses and stderr
+            self._reader_task = asyncio.create_task(self._response_reader())
+            self._stderr_task = asyncio.create_task(self._log_stderr())
+
+    async def _response_reader(self):
+        """Background task: reads DONE/ERROR from daemon stdout and resolves pending Futures.
+        
+        This runs continuously and dispatches responses in FIFO order to match
+        the order commands were written to stdin.
+        """
+        try:
+            while self.proc and self.proc.returncode is None:
+                line = await self.proc.stdout.readline()
+                if not line:
+                    break
+                
+                resp = line.decode().strip()
+                
+                try:
+                    future = self._pending.get_nowait()
+                except asyncio.QueueEmpty:
+                    print(f"[{self.model_name}] Unexpected daemon output (no waiter): {resp}")
+                    continue
+                
+                if future.done():
+                    continue
+                
+                if resp.startswith("DONE|"):
+                    future.set_result((True, resp.split("|", 1)[1]))
+                elif resp.startswith("ERROR|"):
+                    future.set_result((False, resp.split("|", 1)[1]))
+                else:
+                    future.set_result((False, f"Unexpected response: {resp}"))
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            print(f"[{self.model_name}] Response reader error: {e}")
+        finally:
+            # Daemon died or reader cancelled — fail all pending futures
+            self._fail_all_pending("Model process terminated unexpectedly")
+
+    def _fail_all_pending(self, error_msg: str):
+        """Resolve all pending Futures with an error (daemon died)."""
+        while not self._pending.empty():
+            try:
+                future = self._pending.get_nowait()
+                if not future.done():
+                    future.set_result((False, error_msg))
+            except asyncio.QueueEmpty:
+                break
 
     async def _log_stderr(self):
         try:
@@ -257,38 +337,99 @@ class ModelManager:
         except asyncio.CancelledError:
             pass
 
-    async def synthesize(self, text, output, speaker="", reference="", instruct="", embedding="", retry=True):
-        async with self.lock:
-            try:
-                if not self.proc or self.proc.returncode is not None:
-                    await self.start()
-                
-                # Format: TEXT|OUTPUT|SPEAKER|REF|INSTRUCT|EMBEDDING
-                cmd_line = f"{text}|{output}|{speaker}|{reference}|{instruct}|{embedding}\n"
+    async def _ensure_running(self):
+        """Ensure daemon is running, restart if dead."""
+        if not self.proc or self.proc.returncode is not None:
+            await self.start()
+
+    async def synthesize(self, text, output, speaker="", reference="", instruct="", embedding=""):
+        """Submit a single synthesis command. Returns immediately after writing to stdin,
+        then awaits the Future which is resolved by the background _response_reader."""
+        await self._ensure_running()
+        
+        loop = asyncio.get_event_loop()
+        future = loop.create_future()
+        
+        async with self._write_lock:
+            # Re-check after acquiring write lock (another coroutine may have restarted)
+            if not self.proc or self.proc.returncode is not None:
+                await self.start()
+            
+            cmd_line = f"{text}|{output}|{speaker}|{reference}|{instruct}|{embedding}\n"
+            self.proc.stdin.write(cmd_line.encode())
+            await self.proc.stdin.drain()
+            # Register future INSIDE write_lock to maintain FIFO order with writes
+            await self._pending.put(future)
+        
+        # Await result — write_lock is released, other requests can pipeline
+        result = await future
+        
+        # If daemon died, try restart + one retry
+        if not result[0] and (not self.proc or self.proc.returncode is not None):
+            print(f"Daemon died during synthesis, restarting for retry...")
+            await self.start()
+            return await self._synthesize_no_retry(text, output, speaker, reference, instruct, embedding)
+        
+        return result
+
+    async def _synthesize_no_retry(self, text, output, speaker="", reference="", instruct="", embedding=""):
+        """Single attempt, no retry (used after restart to avoid infinite loops)."""
+        await self._ensure_running()
+        
+        loop = asyncio.get_event_loop()
+        future = loop.create_future()
+        
+        async with self._write_lock:
+            if not self.proc or self.proc.returncode is not None:
+                return False, "Model process not running"
+            cmd_line = f"{text}|{output}|{speaker}|{reference}|{instruct}|{embedding}\n"
+            self.proc.stdin.write(cmd_line.encode())
+            await self.proc.stdin.drain()
+            await self._pending.put(future)
+        
+        return await future
+
+    async def synthesize_batch(self, requests: list):
+        """Pipeline multiple commands to stdin at once. Works both within a single
+        HTTP request (internal chunking) and across concurrent HTTP requests.
+        
+        All commands are written under a single _write_lock acquisition, ensuring
+        they are contiguous in the daemon's stdin buffer.
+        """
+        if not requests:
+            return []
+        
+        if len(requests) == 1:
+            r = requests[0]
+            return [await self.synthesize(
+                r['text'], r['output'], r.get('speaker', ''),
+                r.get('reference', ''), r.get('instruct', ''),
+                r.get('embedding', '')
+            )]
+
+        await self._ensure_running()
+        
+        loop = asyncio.get_event_loop()
+        futures = []
+        
+        async with self._write_lock:
+            if not self.proc or self.proc.returncode is not None:
+                await self.start()
+            
+            for r in requests:
+                future = loop.create_future()
+                cmd_line = "{text}|{output}|{speaker}|{reference}|{instruct}|{embedding}\n".format(
+                    text=r['text'], output=r['output'],
+                    speaker=r.get('speaker', ''), reference=r.get('reference', ''),
+                    instruct=r.get('instruct', ''), embedding=r.get('embedding', '')
+                )
                 self.proc.stdin.write(cmd_line.encode())
-                await self.proc.stdin.drain()
-                
-                line = await self.proc.stdout.readline()
-                if not line:
-                    if retry:
-                        print(f"Model daemon died, restarting and retrying...")
-                        self.proc = None
-                        return await self.synthesize(text, output, speaker, reference, instruct, embedding, retry=False)
-                    return False, "Model process terminated unexpectedly"
-                    
-                resp = line.decode().strip()
-                if resp.startswith("DONE|"):
-                    return True, resp.split("|")[1]
-                elif resp.startswith("ERROR|"):
-                    return False, resp.split("|")[1]
-                else:
-                    return False, f"Unexpected response: {resp}"
-            except Exception as e:
-                if retry:
-                    print(f"Synthesis error: {e}, retrying...")
-                    self.proc = None
-                    return await self.synthesize(text, output, speaker, reference, instruct, embedding, retry=False)
-                return False, str(e)
+                await self._pending.put(future)
+                futures.append(future)
+            await self.proc.stdin.drain()
+        
+        # Await all results — write_lock released, other requests can pipeline
+        return [await f for f in futures]
 
 async def get_manager(model_name: str) -> ModelManager:
     async with manager_lock:
@@ -378,28 +519,38 @@ async def create_speech(req: SpeechRequest):
 
     temp_wavs = []
     try:
+        # Build all chunk requests upfront
+        batch_requests = []
         for i, chunk in enumerate(text_chunks):
             chunk_wav = Path(f"/tmp/chunk_{request_id}_{i}.wav")
+            temp_wavs.append(chunk_wav)
             
             # For the first chunk, if we need to extract, we pass both reference and the target embedding path
             # For subsequent chunks, we only pass the embedding path
             current_reference = reference if i == 0 else ""
             
-            success, result_path = await manager.synthesize(
-                text=chunk,
-                output=str(chunk_wav),
-                speaker=speaker,
-                reference=current_reference,
-                instruct=instruction or "",
-                embedding=embedding # This will be the cache path
-            )
+            batch_requests.append({
+                'text': chunk,
+                'output': str(chunk_wav),
+                'speaker': speaker,
+                'reference': current_reference,
+                'instruct': instruction or "",
+                'embedding': embedding,
+            })
 
-            if success and chunk_wav.exists():
-                temp_wavs.append(chunk_wav)
+        # Pipeline ALL chunks to the daemon at once — eliminates per-chunk
+        # IPC round-trip idle time. The daemon processes them back-to-back
+        # with zero GPU idle gap between chunks.
+        results = await manager.synthesize_batch(batch_requests)
+
+        successful_wavs = []
+        for i, (success, result_path) in enumerate(results):
+            if success and temp_wavs[i].exists():
+                successful_wavs.append(temp_wavs[i])
             else:
                 print(f"Error synthesizing chunk {i}: {result_path}")
 
-        if not temp_wavs:
+        if not successful_wavs:
             raise HTTPException(status_code=500, detail="Audio generation failed")
 
         # Concatenate into final output
@@ -408,7 +559,7 @@ async def create_speech(req: SpeechRequest):
         # Use wave module for simple concatenation
         data = []
         params = None
-        for wav_path in temp_wavs:
+        for wav_path in successful_wavs:
             with wave.open(str(wav_path), 'rb') as w:
                 if params is None:
                     params = w.getparams()
@@ -424,7 +575,10 @@ async def create_speech(req: SpeechRequest):
         if fmt == "mp3":
             final_output = Path(f"/tmp/final_{request_id}.mp3")
             conv_cmd = ["ffmpeg", "-i", str(final_wav), "-codec:a", "libmp3lame", "-qscale:a", "2", str(final_output), "-y"]
-            subprocess.run(conv_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            conv_proc = await asyncio.create_subprocess_exec(
+                *conv_cmd, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL
+            )
+            await conv_proc.wait()
             media_type = "audio/mpeg"
         else:
             final_output = final_wav
