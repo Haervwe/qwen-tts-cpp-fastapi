@@ -15,6 +15,7 @@ from fastapi import FastAPI, HTTPException, UploadFile, File
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 from starlette.background import BackgroundTask
+from normalizer import normalizer
 
 app = FastAPI(title="Qwen3-TTS OpenAI-Compatible API")
 
@@ -34,6 +35,10 @@ EMBED_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 # Default model if not specified
 DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "qwen3-tts-0.6b-f16.gguf")
 
+# Enablement Flags (useful for llama-swap where one process = one model type)
+ENABLE_TTS = os.getenv("ENABLE_TTS", "true").lower() == "true"
+ENABLE_STT = os.getenv("ENABLE_STT", "true").lower() == "true"
+
 # Whisper Configuration
 WHISPER_CLI_PATH = Path(os.getenv("WHISPER_CLI_PATH", str(BASE_DIR / "whisper.cpp/build/bin/whisper-cli")))
 WHISPER_MODEL_PATH = Path(os.getenv("WHISPER_MODEL_PATH", "/mnt/data/models_storage/TTS/whisper/ggml-medium.bin"))
@@ -41,6 +46,26 @@ TRANSCRIPT_CACHE_DIR = EMBED_CACHE_DIR # Reuse embed cache dir for transcripts
 
 # Cache for model info and speakers
 _model_cache = {}
+MODEL_CAPS_CACHE_FILE = EMBED_CACHE_DIR / "model_caps_cache.json"
+
+def load_caps_cache():
+    global _model_cache
+    if MODEL_CAPS_CACHE_FILE.exists():
+        try:
+            with open(MODEL_CAPS_CACHE_FILE, "r") as f:
+                _model_cache = json.load(f)
+        except Exception as e:
+            print(f"Error loading caps cache: {e}")
+
+def save_caps_cache():
+    try:
+        with open(MODEL_CAPS_CACHE_FILE, "w") as f:
+            json.dump(_model_cache, f)
+    except Exception as e:
+        print(f"Error saving caps cache: {e}")
+
+# Initial load
+load_caps_cache()
 
 def get_model_capabilities(model_name: str):
     if not model_name.endswith(".gguf"):
@@ -49,11 +74,16 @@ def get_model_capabilities(model_name: str):
     if model_name in _model_cache:
         return _model_cache[model_name]
     
+    # If TTS is disabled, don't trigger the heavy CLI probe
+    if not ENABLE_TTS:
+        return {"speakers": [], "model_type": "base", "supports_voice_clone": False}
+
     info = {"speakers": [], "model_type": "base", "supports_voice_clone": False}
     
     # Get basic info
     cmd_info = [str(CLI_PATH), "-m", str(MODELS_BASE_DIR), "--model-name", model_name, "--info"]
     try:
+        print(f"Probing model info: {model_name}...")
         res = subprocess.run(cmd_info, capture_output=True, text=True, timeout=10)
         output = res.stdout
         start = output.find("{")
@@ -74,6 +104,7 @@ def get_model_capabilities(model_name: str):
         print(f"Error getting speakers list: {e}")
         
     _model_cache[model_name] = info
+    save_caps_cache()
     return info
 
 class SpeechRequest(BaseModel):
@@ -105,23 +136,24 @@ def load_presets():
 @app.get("/v1/models")
 async def list_models():
     models_data = []
-    # Add actual model files
-    for f in MODELS_BASE_DIR.glob("*.gguf"):
-        models_data.append({
-            "id": f.name,
-            "object": "model",
-            "created": int(f.stat().st_mtime),
-            "owned_by": "qwen"
-        })
     
-    # Also add voices as models for better integration with generic clients
-    voices_resp = await list_voices()
-    for v in voices_resp.get("data", []):
+    # 1. Add TTS models (GGUF files)
+    if ENABLE_TTS:
+        for f in MODELS_BASE_DIR.glob("*.gguf"):
+            models_data.append({
+                "id": f.name,
+                "object": "model",
+                "created": int(f.stat().st_mtime),
+                "owned_by": "qwen"
+            })
+    
+    # 2. Add STT models
+    if ENABLE_STT:
         models_data.append({
-            "id": v["id"],
+            "id": "whisper-1",
             "object": "model",
             "created": 1600000000,
-            "owned_by": "system"
+            "owned_by": "openai"
         })
         
     return {"object": "list", "data": models_data}
@@ -136,9 +168,12 @@ async def list_voices(model: Optional[str] = None):
     voice_files = [f.stem for f in VOICES_DIR.glob("*.wav")]
     preset_names = list(current_presets.keys())
     
-    # Also include internal speakers for the requested model or default
-    target_model = model or DEFAULT_MODEL
-    info = get_model_capabilities(target_model)
+    # 3. Internal speakers
+    # Only probe for internal speakers if a model is specified OR if we want to show defaults
+    # When ENABLE_TTS is false, get_model_capabilities returns empty immediately.
+    target_model = model or (DEFAULT_MODEL if ENABLE_TTS else None)
+    info = get_model_capabilities(target_model) if target_model else None
+    
     internal_speakers = info.get("speakers", []) if info else []
     model_type = info.get("model_type", "base") if info else "base"
     
@@ -198,6 +233,9 @@ async def transcribe_audio(
     response_format: Optional[str] = "json"
 ):
     """OpenAI-compatible transcription endpoint."""
+    if not ENABLE_STT:
+        raise HTTPException(status_code=400, detail="STT engine is disabled on this server instance.")
+    
     temp_file = Path(f"/tmp/{uuid.uuid4()}_{file.filename}")
     try:
         # Save upload to temp file
@@ -250,24 +288,6 @@ async def normalize_audio(input_path: Path, output_path: Path):
         print(f"FFmpeg Error: {stderr.decode()}")
         raise Exception(f"ffmpeg failed to normalize audio {input_path}")
 
-def normalize_text(text: str) -> str:
-    """Basic text normalization for TTS and sanitization for daemon protocol."""
-    # Sanitize: remove newlines and pipes which break the daemon protocol
-    text = text.replace("\n", " ").replace("\r", " ").replace("|", " ")
-    
-    abbreviations = {
-        r"\bDr\.\b": "Doctor",
-        r"\bMr\.\b": "Mister",
-        r"\bMs\.\b": "Miss",
-        r"\bMrs\.\b": "Missus",
-        r"\bSt\.\b": "Street",
-        r"\bAve\.\b": "Avenue",
-        r"\bRd\.\b": "Road",
-        r"\bvs\.\b": "versus",
-        r"\betc\.\b": "et cetera",
-    }
-    for pattern, replacement in abbreviations.items():
-        text = re.sub(pattern, replacement, text, flags=re.IGNORECASE)
     return text
 
 managers: Dict[str, 'ModelManager'] = {}
@@ -546,37 +566,21 @@ async def get_manager(model_name: str) -> ModelManager:
     await manager.start()
     return manager
 
-def split_text(text: str, max_chars: int = 300) -> List[str]:
-    sentences = re.split(r'(?<=[.!?])\s+', text)
-    chunks = []
-    current_chunk = ""
-    for sentence in sentences:
-        if len(current_chunk) + len(sentence) < max_chars:
-            current_chunk += (" " if current_chunk else "") + sentence
-        else:
-            if current_chunk: chunks.append(current_chunk)
-            if len(sentence) > max_chars:
-                sub_sentences = re.split(r'(?<=[,;])\s+', sentence)
-                temp_chunk = ""
-                for sub in sub_sentences:
-                    if len(temp_chunk) + len(sub) < max_chars:
-                        temp_chunk += (" " if temp_chunk else "") + sub
-                    else:
-                        if temp_chunk: chunks.append(temp_chunk)
-                        temp_chunk = sub
-                current_chunk = temp_chunk
-            else:
-                current_chunk = sentence
-    if current_chunk: chunks.append(current_chunk)
-    return chunks
+def split_text(text: str, lang: str = "en") -> List[str]:
+    return normalizer.split_sentences(text, lang)
 
 @app.post("/v1/audio/speech")
 async def create_speech(req: SpeechRequest):
+    if not ENABLE_TTS:
+        raise HTTPException(status_code=400, detail="TTS engine is disabled on this server instance.")
+    
     model_name = req.model or DEFAULT_MODEL
-    text = normalize_text(req.input)
     voice_name = req.voice
     instruction = req.extra_body.get("instruction") if req.extra_body else None
 
+    # 1. Professional Normalization
+    text, detected_lang = normalizer.process(req.input)
+    
     info = get_model_capabilities(model_name)
     current_presets = load_presets()
     if voice_name in current_presets:
@@ -585,13 +589,13 @@ async def create_speech(req: SpeechRequest):
         if not instruction:
             instruction = preset.get("instruction")
 
-    text_chunks = split_text(text)
+    # 2. Sentence-based splitting
+    text_chunks = normalizer.split_sentences(text, detected_lang)
     if not text_chunks:
         raise HTTPException(status_code=400, detail="Empty input text")
 
     request_id = uuid.uuid4().hex
     manager = await get_manager(model_name)
-    temp_wavs = []
     
     # Determine voice params once for all chunks
     speaker = ""
@@ -607,49 +611,33 @@ async def create_speech(req: SpeechRequest):
         
         if model_type == "base" and reference_wav.exists() and info.get("supports_voice_clone"):
             wav_hash = get_file_sha256(reference_wav)
-            # Use full model name to differentiate dimensions (0.6b vs 1.7b)
             embed_cache_path = EMBED_CACHE_DIR / f"{voice_name}_{model_name}_{wav_hash}.json"
             transcript_cache_path = TRANSCRIPT_CACHE_DIR / f"{voice_name}_{wav_hash}.txt"
             processed_wav_path = EMBED_CACHE_DIR / f"processed_{wav_hash}.wav"
             
-            # 1. Normalize audio (truncate to 30s, etc.)
+            # Normalize audio
             if not processed_wav_path.exists():
-                print(f"Normalizing reference audio for {voice_name}...")
                 try:
                     await normalize_audio(reference_wav, processed_wav_path)
-                except Exception as e:
-                    print(f"Audio normalization failed: {e}")
-                    # Fallback to original if normalization fails
+                except:
                     processed_wav_path = reference_wav
             
-            # 2. Load or compute transcript (Full ICL requires transcript)
+            # Transcription (cached)
             auto_transcript = ""
             if transcript_cache_path.exists():
                 try:
                     auto_transcript = transcript_cache_path.read_text().strip()
-                    print(f"Loaded cached transcript for {voice_name}")
-                except Exception as e:
-                    print(f"Error reading cached transcript: {e}")
+                except: pass
             
             if not auto_transcript:
-                print(f"Transcribing reference audio for {voice_name}...")
                 try:
-                    # Always transcribe the processed (30s max) version
                     auto_transcript = await WhisperManager.transcribe(processed_wav_path)
                     if auto_transcript:
                         transcript_cache_path.write_text(auto_transcript)
-                        print(f"Saved transcript to {transcript_cache_path}")
-                except Exception as e:
-                    print(f"Transcription failed: {e}")
+                except: pass
             
-            # 3. Combine auto transcript with user instruction
             if auto_transcript:
-                # Sanitize: remove newlines and pipes which break the daemon protocol
                 auto_transcript = auto_transcript.replace("\n", " ").replace("\r", " ").replace("|", " ")
-                
-                # Note: Character-based truncation removed per user request. 
-                # We now rely on the 30s audio truncation above.
-                    
                 if instruction:
                     instruction = f"{auto_transcript}. {instruction}"
                 else:
@@ -657,95 +645,112 @@ async def create_speech(req: SpeechRequest):
 
             if embed_cache_path.exists():
                 embedding = str(embed_cache_path)
-                reference = ""
             else:
-                # Trigger extraction on the first chunk of the batch
-                print(f"Extraction will be triggered on the first chunk for {voice_name}...")
                 reference = str(processed_wav_path)
                 embedding = str(embed_cache_path)
         else:
-            # Fallback for non-base models or missing WAVs
             if info and info.get("speakers"):
-                # Use the first available internal speaker as fallback
                 speaker = info.get("speakers")[0]
             else:
                 speaker = "vivian"
 
-    try:
-        # Build all chunk requests upfront
-        batch_requests = []
-        for i, chunk in enumerate(text_chunks):
-            chunk_wav = Path(f"/tmp/chunk_{request_id}_{i}.wav")
-            temp_wavs.append(chunk_wav)
+    async def audio_generator():
+        temp_files = []
+        try:
+            # First chunk is priority (Sprint)
+            first_text = text_chunks[0]
+            first_wav = Path(f"/tmp/chunk_{request_id}_0.wav")
+            temp_files.append(first_wav)
             
-            batch_requests.append({
-                'text': chunk,
-                'output': str(chunk_wav),
-                'speaker': speaker,
-                'reference': reference if i == 0 else "", # Extract only on first chunk
-                'instruct': instruction or "",
-                'embedding': embedding,
-            })
-
-        # Pipeline ALL chunks to the daemon
-        if batch_requests:
-            results = await manager.synthesize_batch(batch_requests)
+            # Start background synthesis for the rest IMMEDIATELY
+            background_requests = []
+            for i in range(1, len(text_chunks)):
+                chunk_wav = Path(f"/tmp/chunk_{request_id}_{i}.wav")
+                temp_files.append(chunk_wav)
+                background_requests.append({
+                    'text': text_chunks[i],
+                    'output': str(chunk_wav),
+                    'speaker': speaker,
+                    'reference': "", 
+                    'instruct': instruction or "",
+                    'embedding': embedding,
+                })
             
-            for i, (success, result_path) in enumerate(results):
-                if not success:
-                    print(f"Error synthesizing chunk {i}: {result_path}")
+            # Pipeline the rest to the daemon's stdin buffer
+            if background_requests:
+                # Fire and forget into the daemon's queue (ModelManager handles the FIFO)
+                asyncio.create_task(manager.synthesize_batch(background_requests))
 
-        successful_wavs = []
-        for i, wav_path in enumerate(temp_wavs):
-            if wav_path.exists():
-                successful_wavs.append(wav_path)
-
-        if not successful_wavs:
-            raise HTTPException(status_code=500, detail="Audio generation failed")
-
-        # Concatenate into final output
-        final_wav = Path(f"/tmp/final_{request_id}.wav")
-        
-        # Use wave module for simple concatenation
-        data = []
-        params = None
-        for wav_path in successful_wavs:
-            with wave.open(str(wav_path), 'rb') as w:
-                if params is None:
-                    params = w.getparams()
-                data.append(w.readframes(w.getnframes()))
-        
-        with wave.open(str(final_wav), 'wb') as w:
-            w.setparams(params)
-            for d in data:
-                w.writeframes(d)
-
-        # Convert to requested format if needed (OpenAI default is mp3)
-        fmt = req.response_format or "mp3"
-        if fmt == "mp3":
-            final_output = Path(f"/tmp/final_{request_id}.mp3")
-            conv_cmd = ["ffmpeg", "-i", str(final_wav), "-codec:a", "libmp3lame", "-qscale:a", "2", str(final_output), "-y"]
-            conv_proc = await asyncio.create_subprocess_exec(
-                *conv_cmd, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL
+            # Synthesize and stream the FIRST chunk
+            print(f"Synthesizing first chunk: {first_text[:30]}...")
+            success, _ = await manager.synthesize(
+                first_text, str(first_wav), speaker, reference, instruction or "", embedding
             )
-            await conv_proc.wait()
-            media_type = "audio/mpeg"
-        else:
-            final_output = final_wav
-            media_type = "audio/wav"
+            
+            if success and first_wav.exists():
+                # Apply 5ms fade-in/out and convert to MP3
+                mp3_data = await convert_wav_to_mp3(first_wav, apply_fades=True)
+                yield mp3_data
+            
+            # Stream the rest as they finish
+            for i in range(1, len(text_chunks)):
+                chunk_wav = Path(f"/tmp/chunk_{request_id}_{i}.wav")
+                # Wait for the background task to finish this specific chunk
+                # (The ModelManager already has the future for this in its queue)
+                # We just need to wait until the file exists
+                max_wait = 30 # seconds
+                waited = 0
+                while not chunk_wav.exists() and waited < max_wait:
+                    await asyncio.sleep(0.05)
+                    waited += 0.05
+                
+                if chunk_wav.exists():
+                    mp3_data = await convert_wav_to_mp3(chunk_wav, apply_fades=True)
+                    yield mp3_data
+                    
+        finally:
+            # Cleanup all temp files
+            for f in temp_files:
+                if f.exists():
+                    try: os.remove(f)
+                    except: pass
 
-        def cleanup():
-            for f in temp_wavs:
-                if f.exists(): os.remove(f)
-            if final_wav.exists(): os.remove(final_wav)
-            if final_output != final_wav and final_output.exists(): os.remove(final_output)
+    return StreamingResponse(audio_generator(), media_type="audio/mpeg")
 
-        return FileResponse(final_output, media_type=media_type, background=BackgroundTask(cleanup))
+async def convert_wav_to_mp3(wav_path: Path, apply_fades: bool = True) -> bytes:
+    """Convert WAV to MP3 and apply 5ms fades to prevent clicks between chunks."""
+    if not wav_path.exists():
+        return b""
+        
+    duration = 0.0
+    if apply_fades:
+        try:
+            # Get duration using ffprobe
+            probe_cmd = [
+                "ffprobe", "-v", "error", "-show_entries", "format=duration",
+                "-of", "default=noprint_wrappers=1:nokey=1", str(wav_path)
+            ]
+            proc = await asyncio.create_subprocess_exec(
+                *probe_cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL
+            )
+            stdout, _ = await proc.communicate()
+            duration = float(stdout.decode().strip())
+        except:
+            apply_fades = False
 
-    except Exception as e:
-        for f in temp_wavs:
-            if f.exists(): os.remove(f)
-        raise HTTPException(status_code=500, detail=str(e))
+    cmd = ["ffmpeg", "-i", str(wav_path)]
+    if apply_fades and duration > 0.01:
+        # Apply 5ms fade-in and 5ms fade-out
+        fade_out_start = max(0, duration - 0.005)
+        cmd.extend(["-af", f"afade=t=in:st=0:d=0.005,afade=t=out:st={fade_out_start}:d=0.005"])
+
+    cmd.extend(["-codec:a", "libmp3lame", "-qscale:a", "2", "-f", "mp3", "pipe:1"])
+    
+    proc = await asyncio.create_subprocess_exec(
+        *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL
+    )
+    stdout, _ = await proc.communicate()
+    return stdout
 
 if __name__ == "__main__":
     import uvicorn
