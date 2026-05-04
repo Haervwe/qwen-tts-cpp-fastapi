@@ -39,47 +39,124 @@ class TextNormalizer:
             normalize_whitespace=True,
         )
 
+    # Languages that use dot as thousands separator and comma as decimal
+    # e.g. 25.000,50 instead of 25,000.50
+    DOT_THOUSANDS_LANGS = {"es", "fr", "de", "it", "pt", "ru"}
+    
+    def _normalize_number(self, num_str: str, lang: str) -> str:
+        """Convert a locale-formatted number string to a plain float string.
+        
+        English-style: 25,000.50 → 25000.50
+        Spanish-style: 25.000,50 → 25000.50
+        """
+        if lang in self.DOT_THOUSANDS_LANGS:
+            # dot = thousands, comma = decimal
+            num_str = num_str.replace(".", "").replace(",", ".")
+        else:
+            # comma = thousands, dot = decimal (English, Chinese, etc.)
+            num_str = num_str.replace(",", "")
+        return num_str
+    
+    def _num2words_lang(self, lang: str) -> str:
+        """Map detected language to num2words language code."""
+        mapping = {"en": "en", "es": "es", "fr": "fr", "de": "de", 
+                   "it": "it", "pt": "pt_BR", "ru": "ru", "zh": "zh",
+                   "ja": "ja", "ko": "ko"}
+        return mapping.get(lang, "en")
+
     def process(self, text):
         """Full normalization pipeline using professional packages."""
         text = self.clean_text(text)
         lang = self.detect_language(text)
         
-        # 1. Number & Currency Expansion (num2words is the industry standard here)
+        # 1. Number & Currency Expansion
+        # Qwen3-TTS handles most text natively, but struggles with raw digits.
+        # Number formats vary by locale:
+        #   English:  25,000.50  (comma=thousands, dot=decimal)
+        #   Spanish:  25.000,50  (dot=thousands, comma=decimal)
+        n2w_lang = self._num2words_lang(lang)
+        
         try:
-            if lang == "en":
-                text = re.sub(r"\$(\d+(?:\.\d+)?)", lambda m: f"{num2words(m.group(1), lang='en')} dollars", text)
-                text = re.sub(r"(\d+(?:\.\d+)?)%", lambda m: f"{num2words(m.group(1), lang='en')} percent", text)
-                # Standard numbers
-                text = re.sub(r"\b\d+(?:\.\d+)?\b", lambda m: num2words(m.group(0), lang='en'), text)
+            if lang in self.DOT_THOUSANDS_LANGS:
+                # Dot-thousands locale (es, fr, de, it, pt, ru)
+                # Currency: $25.000,50 or €25.000,50
+                text = re.sub(
+                    r"[\$€£]([\d.]+(?:,\d+)?)",
+                    lambda m: f"{num2words(self._normalize_number(m.group(1), lang), lang=n2w_lang)} {self._currency_word(m.group(0)[0], lang)}",
+                    text
+                )
+                # Percentages: 99,5%
+                text = re.sub(
+                    r"([\d.]+(?:,\d+)?)%",
+                    lambda m: f"{num2words(self._normalize_number(m.group(1), lang), lang=n2w_lang)} {self._percent_word(lang)}",
+                    text
+                )
+                # Numbers with dot-thousands: 25.000 / 1.000.000
+                text = re.sub(
+                    r"\b(\d{1,3}(?:\.\d{3})+(?:,\d+)?)\b",
+                    lambda m: num2words(self._normalize_number(m.group(0), lang), lang=n2w_lang),
+                    text
+                )
+                # Plain numbers (2+ digits): 42 → cuarenta y dos
+                text = re.sub(
+                    r"\b(\d{2,}(?:,\d+)?)\b",
+                    lambda m: num2words(self._normalize_number(m.group(0), lang), lang=n2w_lang),
+                    text
+                )
             elif lang == "zh":
-                text = re.sub(r"\$(\d+(?:\.\d+)?)", lambda m: f"{num2words(m.group(1), lang='zh')}美元", text)
-                text = re.sub(r"￥(\d+(?:\.\d+)?)", lambda m: f"{num2words(m.group(1), lang='zh')}元", text)
-                text = re.sub(r"(\d+(?:\.\d+)?)%", lambda m: f"{num2words(m.group(1), lang='zh')}百分之", text)
-                # Standard numbers
-                text = re.sub(r"\b\d+(?:\.\d+)?\b", lambda m: num2words(m.group(0), lang='zh'), text)
+                text = re.sub(r"\$([\d,]+(?:\.\d+)?)", lambda m: f"{num2words(self._normalize_number(m.group(1), lang), lang='zh')}美元", text)
+                text = re.sub(r"￥([\d,]+(?:\.\d+)?)", lambda m: f"{num2words(self._normalize_number(m.group(1), lang), lang='zh')}元", text)
+                text = re.sub(r"([\d,]+(?:\.\d+)?)%", lambda m: f"{num2words(self._normalize_number(m.group(1), lang), lang='zh')}百分之", text)
+                text = re.sub(r"\b\d+(?:,\d{3})*(?:\.\d+)?\b", lambda m: num2words(self._normalize_number(m.group(0), lang), lang='zh'), text)
+            else:
+                # English and other comma-thousands locales
+                text = re.sub(
+                    r"\$([\d,]+(?:\.\d+)?)",
+                    lambda m: f"{num2words(self._normalize_number(m.group(1), lang), lang=n2w_lang)} dollars",
+                    text
+                )
+                text = re.sub(
+                    r"([\d,]+(?:\.\d+)?)%",
+                    lambda m: f"{num2words(self._normalize_number(m.group(1), lang), lang=n2w_lang)} percent",
+                    text
+                )
+                text = re.sub(
+                    r"\b(\d{1,3}(?:,\d{3})+(?:\.\d+)?)\b",
+                    lambda m: num2words(self._normalize_number(m.group(0), lang), lang=n2w_lang),
+                    text
+                )
+                text = re.sub(
+                    r"\b(\d{2,}(?:\.\d+)?)\b",
+                    lambda m: num2words(m.group(0), lang=n2w_lang),
+                    text
+                )
         except:
             pass
 
         # 2. Language-Specific Text Normalization
-        if lang == "en":
-            # Gruut handles abbreviations and complex English text expansion
+        if lang == "zh":
             try:
-                sents = []
-                for sent in gruut_sentences(text, lang="en-us"):
-                    sents.append(" ".join(word.text for word in sent))
-                text = " ".join(sents)
-            except:
-                pass
-        
-        elif lang == "zh":
-            # zh_normalization is the industry standard for Chinese TTS
-            try:
-                # zh_normalization.normalize returns a list of sentences
                 text = "".join(self.zh_norm.normalize(text))
             except:
                 pass
+        # Note: gruut removed — Qwen3-TTS handles English abbreviations natively.
             
         return text, lang
+    
+    def _currency_word(self, symbol: str, lang: str) -> str:
+        """Return the spoken currency name for a symbol."""
+        currencies = {
+            "$": {"es": "dólares", "fr": "dollars", "de": "Dollar", "it": "dollari", "pt": "dólares", "ru": "долларов"},
+            "€": {"es": "euros", "fr": "euros", "de": "Euro", "it": "euro", "pt": "euros", "ru": "евро"},
+            "£": {"es": "libras", "fr": "livres", "de": "Pfund", "it": "sterline", "pt": "libras", "ru": "фунтов"},
+        }
+        return currencies.get(symbol, {}).get(lang, "dollars")
+    
+    def _percent_word(self, lang: str) -> str:
+        """Return the spoken word for percent."""
+        words = {"es": "por ciento", "fr": "pour cent", "de": "Prozent", 
+                 "it": "per cento", "pt": "por cento", "ru": "процентов"}
+        return words.get(lang, "percent")
 
     def split_sentences(self, text, lang=None):
         """Split text into sentences using pysbd."""

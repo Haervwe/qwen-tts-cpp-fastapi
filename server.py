@@ -7,6 +7,7 @@ import hashlib
 import re
 import wave
 import io
+import logging
 from pathlib import Path
 from typing import Optional, List, Dict
 
@@ -18,6 +19,13 @@ from starlette.background import BackgroundTask
 from normalizer import normalizer
 
 app = FastAPI(title="Qwen3-TTS OpenAI-Compatible API")
+
+# Setup Logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger("qwen-tts")
 
 # Load environment variables
 load_dotenv()
@@ -55,14 +63,14 @@ def load_caps_cache():
             with open(MODEL_CAPS_CACHE_FILE, "r") as f:
                 _model_cache = json.load(f)
         except Exception as e:
-            print(f"Error loading caps cache: {e}")
+            logger.error(f"Error loading caps cache: {e}")
 
 def save_caps_cache():
     try:
         with open(MODEL_CAPS_CACHE_FILE, "w") as f:
             json.dump(_model_cache, f)
     except Exception as e:
-        print(f"Error saving caps cache: {e}")
+        logger.error(f"Error saving caps cache: {e}")
 
 # Initial load
 load_caps_cache()
@@ -83,14 +91,14 @@ def get_model_capabilities(model_name: str):
     # Get basic info
     cmd_info = [str(CLI_PATH), "-m", str(MODELS_BASE_DIR), "--model-name", model_name, "--info"]
     try:
-        print(f"Probing model info: {model_name}...")
+        logger.info(f"Probing model info: {model_name}...")
         res = subprocess.run(cmd_info, capture_output=True, text=True, timeout=10)
         output = res.stdout
         start = output.find("{")
         if start != -1:
             info.update(json.loads(output[start:]))
     except Exception as e:
-        print(f"Error getting model info: {e}")
+        logger.error(f"Error getting model info: {e}")
 
     # Get speakers list
     cmd_speakers = [str(CLI_PATH), "-m", str(MODELS_BASE_DIR), "--model-name", model_name, "--list-speakers"]
@@ -101,7 +109,7 @@ def get_model_capabilities(model_name: str):
         if start != -1:
             info["speakers"] = json.loads(output[start:])
     except Exception as e:
-        print(f"Error getting speakers list: {e}")
+        logger.error(f"Error getting speakers list: {e}")
         
     _model_cache[model_name] = info
     save_caps_cache()
@@ -130,7 +138,7 @@ def load_presets():
             with open(PRESETS_FILE, "r") as f:
                 return json.load(f)
         except Exception as e:
-            print(f"Error loading presets: {e}")
+            logger.error(f"Error loading presets: {e}")
     return {}
 
 @app.get("/v1/models")
@@ -251,7 +259,7 @@ async def transcribe_audio(
         return TranscriptionResponse(text=text, language=language)
         
     except Exception as e:
-        print(f"Transcription error: {e}")
+        logger.error(f"Transcription error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         if temp_file.exists():
@@ -265,17 +273,73 @@ def get_file_sha256(file_path: Path):
                 sha256_hash.update(byte_block)
         return sha256_hash.hexdigest()[:16]
     except Exception as e:
-        print(f"Error hashing file {file_path}: {e}")
+        logger.error(f"Error hashing file {file_path}: {e}")
         return "unknown"
 
-async def normalize_audio(input_path: Path, output_path: Path):
-    """Normalize audio to 30s max, 24kHz, mono, normalized volume."""
+async def normalize_audio(input_path: Path, output_path: Path, max_duration: float = 15.0):
+    """Normalize audio for ICL voice cloning: 24kHz, mono, normalized volume.
+    
+    Key requirements from Qwen3-TTS documentation:
+    - Reference audio sweet spot is 10-15s. >20s causes generation loops/hangs.
+    - Append 0.5s silence at end to prevent phoneme bleed (clicking artifacts).
+    """
+    # Check source duration
+    probe = await asyncio.create_subprocess_exec(
+        "ffprobe", "-v", "error", "-show_entries", "format=duration",
+        "-of", "default=noprint_wrappers=1:nokey=1", str(input_path),
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL
+    )
+    stdout, _ = await probe.communicate()
+    try:
+        duration = float(stdout.decode().strip())
+    except (ValueError, AttributeError):
+        duration = 0.0
+    
+    if duration > max_duration:
+        # Find a silence near the cut point to truncate at a natural boundary
+        search_start = max(0, max_duration - 10)
+        silence_cmd = [
+            "ffmpeg", "-i", str(input_path),
+            "-ss", str(search_start), "-t", "10",
+            "-af", "silencedetect=noise=-30dB:d=0.3",
+            "-f", "null", "-"
+        ]
+        silence_proc = await asyncio.create_subprocess_exec(
+            *silence_cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+        )
+        _, silence_stderr = await silence_proc.communicate()
+        
+        import re as _re
+        cut_time = max_duration
+        silence_ends = _re.findall(r'silence_end: ([\d.]+)', silence_stderr.decode())
+        if silence_ends:
+            for ts in reversed(silence_ends):
+                t = float(ts) + search_start
+                if t <= max_duration and t >= max_duration - 10:
+                    cut_time = t
+                    break
+            logger.info(f"Smart truncation: {duration:.1f}s → {cut_time:.1f}s (at silence boundary)")
+        else:
+            logger.info(f"No silence found near {max_duration}s, hard-cutting at {max_duration}s")
+    else:
+        cut_time = duration
+    
+    # Build ffmpeg command:
+    # - Truncate to cut_time
+    # - Normalize loudness
+    # - Fade out at end to avoid abrupt cut  
+    # - Pad 0.5s silence at end to prevent phoneme bleed (known Qwen3-TTS artifact)
+    af_filters = ["loudnorm"]
+    if duration > max_duration:
+        af_filters.append(f"afade=t=out:st={max(0, cut_time - 0.1)}:d=0.1")
+    af_filters.append("apad=pad_dur=0.5")
+    
     cmd = [
         "ffmpeg", "-i", str(input_path),
-        "-t", "30",              # Truncate to 30s
-        "-ar", "24000",          # 24kHz
-        "-ac", "1",              # Mono
-        "-af", "loudnorm",       # EBU R128 loudness normalization
+        "-t", str(cut_time),
+        "-ar", "24000",
+        "-ac", "1",
+        "-af", ",".join(af_filters),
         str(output_path),
         "-y"
     ]
@@ -285,10 +349,8 @@ async def normalize_audio(input_path: Path, output_path: Path):
     await proc.wait()
     if proc.returncode != 0:
         _, stderr = await proc.communicate()
-        print(f"FFmpeg Error: {stderr.decode()}")
+        logger.error(f"FFmpeg Error: {stderr.decode()}")
         raise Exception(f"ffmpeg failed to normalize audio {input_path}")
-
-    return text
 
 managers: Dict[str, 'ModelManager'] = {}
 manager_lock = asyncio.Lock()
@@ -314,7 +376,7 @@ class WhisperManager:
             "-np",       # No prints (only the text)
         ]
         
-        print(f"Running Whisper transcription: {' '.join(cmd)}")
+        logger.info(f"Running Whisper transcription: {' '.join(cmd)}")
         proc = await asyncio.create_subprocess_exec(
             *cmd,
             stdout=asyncio.subprocess.PIPE,
@@ -325,7 +387,7 @@ class WhisperManager:
         
         if proc.returncode != 0:
             error_msg = stderr.decode()
-            print(f"Whisper Error: {error_msg}")
+            logger.error(f"Whisper Error: {error_msg}")
             raise Exception(f"Whisper failed with code {proc.returncode}")
 
         text = stdout.decode().strip()
@@ -333,8 +395,6 @@ class WhisperManager:
         text = re.sub(r'\[.*?\]', '', text)
         text = re.sub(r'\(.*?\)', '', text)
         return text.strip()
-        
-        return ""
 
 class ModelManager:
     """Manages a persistent TTS daemon process with pipelined request handling.
@@ -388,7 +448,7 @@ class ModelManager:
                 "--daemon"
             ]
             
-            print(f"Starting model daemon: {' '.join(cmd)}")
+            logger.info(f"Starting model daemon: {' '.join(cmd)}")
             self.proc = await asyncio.create_subprocess_exec(
                 *cmd,
                 stdin=asyncio.subprocess.PIPE,
@@ -402,7 +462,7 @@ class ModelManager:
                 stderr_err = await self.proc.stderr.read(1024)
                 raise Exception(f"Model failed to start: {line.decode().strip()} - {stderr_err.decode()}")
                 
-            print(f"Model {self.model_name} is READY")
+            logger.info(f"Model {self.model_name} is READY")
             
             # Start background tasks for reading responses and stderr
             self._reader_task = asyncio.create_task(self._response_reader())
@@ -425,7 +485,7 @@ class ModelManager:
                 try:
                     future = self._pending.get_nowait()
                 except asyncio.QueueEmpty:
-                    print(f"[{self.model_name}] Unexpected daemon output (no waiter): {resp}")
+                    logger.warning(f"[{self.model_name}] Unexpected daemon output (no waiter): {resp}")
                     continue
                 
                 if future.done():
@@ -440,7 +500,7 @@ class ModelManager:
         except asyncio.CancelledError:
             pass
         except Exception as e:
-            print(f"[{self.model_name}] Response reader error: {e}")
+            logger.error(f"[{self.model_name}] Response reader error: {e}")
         finally:
             # Daemon died or reader cancelled — fail all pending futures
             self._fail_all_pending("Model process terminated unexpectedly")
@@ -460,7 +520,7 @@ class ModelManager:
             while self.proc and self.proc.returncode is None:
                 line = await self.proc.stderr.readline()
                 if not line: break
-                print(f"[{self.model_name}] {line.decode().strip()}")
+                logger.info(f"[{self.model_name}] {line.decode().strip()}")
         except asyncio.CancelledError:
             pass
 
@@ -470,34 +530,38 @@ class ModelManager:
             await self.start()
 
     async def synthesize(self, text, output, speaker="", reference="", instruct="", embedding=""):
-        """Submit a single synthesis command. Returns immediately after writing to stdin,
-        then awaits the Future which is resolved by the background _response_reader."""
+        """Submit a single synthesis command and await the result."""
+        future = await self.submit_synthesis(text, output, speaker, reference, instruct, embedding)
+        result = await future
+        
+        # If daemon died, try restart + one retry
+        if not result[0] and (not self.proc or self.proc.returncode is not None):
+            logger.warning(f"Daemon died during synthesis, restarting for retry...")
+            await self.start()
+            return await self._synthesize_no_retry(text, output, speaker, reference, instruct, embedding)
+        
+        return result
+
+    async def submit_synthesis(self, text, output, speaker="", reference="", instruct="", embedding=""):
+        """Submit a synthesis command and return the Future immediately.
+        Allows the caller to await results as needed (e.g. for streaming).
+        """
         await self._ensure_running()
         
         loop = asyncio.get_event_loop()
         future = loop.create_future()
         
         async with self._write_lock:
-            # Re-check after acquiring write lock (another coroutine may have restarted)
             if not self.proc or self.proc.returncode is not None:
                 await self.start()
             
             cmd_line = f"{text}|{output}|{speaker}|{reference}|{instruct}|{embedding}\n"
+            logger.info(f"[{self.model_name}] → daemon: text=[{len(text)}c]{text[:50]}… ref={'Y' if reference else 'N'} inst=[{len(instruct)}c] emb={'Y' if embedding else 'N'}")
             self.proc.stdin.write(cmd_line.encode())
             await self.proc.stdin.drain()
-            # Register future INSIDE write_lock to maintain FIFO order with writes
             await self._pending.put(future)
-        
-        # Await result — write_lock is released, other requests can pipeline
-        result = await future
-        
-        # If daemon died, try restart + one retry
-        if not result[0] and (not self.proc or self.proc.returncode is not None):
-            print(f"Daemon died during synthesis, restarting for retry...")
-            await self.start()
-            return await self._synthesize_no_retry(text, output, speaker, reference, instruct, embedding)
-        
-        return result
+            
+        return future
 
     async def _synthesize_no_retry(self, text, output, speaker="", reference="", instruct="", embedding=""):
         """Single attempt, no retry (used after restart to avoid infinite loops)."""
@@ -594,6 +658,10 @@ async def create_speech(req: SpeechRequest):
     if not text_chunks:
         raise HTTPException(status_code=400, detail="Empty input text")
 
+    logger.info(f"Input: {len(req.input)} chars → Normalized: {len(text)} chars → {len(text_chunks)} chunks (lang={detected_lang})")
+    for i, chunk in enumerate(text_chunks):
+        logger.debug(f"  Chunk {i}: [{len(chunk)} chars] {chunk[:80]}...")
+
     request_id = uuid.uuid4().hex
     manager = await get_manager(model_name)
     
@@ -638,6 +706,27 @@ async def create_speech(req: SpeechRequest):
             
             if auto_transcript:
                 auto_transcript = auto_transcript.replace("\n", " ").replace("\r", " ").replace("|", " ")
+                # Trim to complete sentences — truncated audio produces fragments
+                # that start/end mid-sentence, breaking voice cloning alignment
+                try:
+                    import pysbd
+                    seg = pysbd.Segmenter(language="en", clean=False)
+                    sentences = seg.segment(auto_transcript)
+                    # Drop first sentence if it starts lowercase (mid-sentence fragment)
+                    if sentences and sentences[0] and sentences[0][0].islower():
+                        logger.info(f"Trimming leading fragment: {sentences[0][:40]}...")
+                        sentences = sentences[1:]
+                    # Drop last sentence if it doesn't end with sentence-ending punctuation
+                    if sentences and sentences[-1] and sentences[-1].strip()[-1] not in '.!?':
+                        logger.info(f"Trimming trailing fragment: ...{sentences[-1][-40:]}")
+                        sentences = sentences[:-1]
+                    if sentences:
+                        auto_transcript = " ".join(s.strip() for s in sentences)
+                    else:
+                        logger.warning("All transcript sentences were fragments, using raw transcript")
+                except Exception as e:
+                    logger.warning(f"Sentence trimming failed: {e}")
+                
                 if instruction:
                     instruction = f"{auto_transcript}. {instruction}"
                 else:
@@ -655,58 +744,82 @@ async def create_speech(req: SpeechRequest):
                 speaker = "vivian"
 
     async def audio_generator():
+        needs_embedding_first = bool(reference)
         temp_files = []
         try:
-            # First chunk is priority (Sprint)
+            # First chunk
             first_text = text_chunks[0]
             first_wav = Path(f"/tmp/chunk_{request_id}_0.wav")
             temp_files.append(first_wav)
             
-            # Start background synthesis for the rest IMMEDIATELY
-            background_requests = []
-            for i in range(1, len(text_chunks)):
-                chunk_wav = Path(f"/tmp/chunk_{request_id}_{i}.wav")
-                temp_files.append(chunk_wav)
-                background_requests.append({
-                    'text': text_chunks[i],
-                    'output': str(chunk_wav),
-                    'speaker': speaker,
-                    'reference': "", 
-                    'instruct': instruction or "",
-                    'embedding': embedding,
-                })
-            
-            # Pipeline the rest to the daemon's stdin buffer
-            if background_requests:
-                # Fire and forget into the daemon's queue (ModelManager handles the FIFO)
-                asyncio.create_task(manager.synthesize_batch(background_requests))
-
-            # Synthesize and stream the FIRST chunk
-            print(f"Synthesizing first chunk: {first_text[:30]}...")
-            success, _ = await manager.synthesize(
+            # 1. Synthesize chunk 0
+            logger.info(f"Synthesizing first chunk: {first_text[:30]}...")
+            first_future = await manager.submit_synthesis(
                 first_text, str(first_wav), speaker, reference, instruction or "", embedding
             )
             
-            if success and first_wav.exists():
-                # Apply 5ms fade-in/out and convert to MP3
-                mp3_data = await convert_wav_to_mp3(first_wav, apply_fades=True)
-                yield mp3_data
-            
-            # Stream the rest as they finish
-            for i in range(1, len(text_chunks)):
-                chunk_wav = Path(f"/tmp/chunk_{request_id}_{i}.wav")
-                # Wait for the background task to finish this specific chunk
-                # (The ModelManager already has the future for this in its queue)
-                # We just need to wait until the file exists
-                max_wait = 30 # seconds
-                waited = 0
-                while not chunk_wav.exists() and waited < max_wait:
-                    await asyncio.sleep(0.05)
-                    waited += 0.05
+            if needs_embedding_first:
+                # Voice clone: chunk 0 computes the embedding file.
+                # We MUST await it before submitting chunks 1-N, otherwise
+                # they try to load a non-existent embedding and fail.
+                logger.info("New voice clone — awaiting first chunk to compute embedding...")
+                success, result = await first_future
                 
-                if chunk_wav.exists():
-                    mp3_data = await convert_wav_to_mp3(chunk_wav, apply_fades=True)
+                if success and first_wav.exists():
+                    mp3_data = await convert_wav_to_mp3(first_wav, apply_fades=True)
                     yield mp3_data
+                else:
+                    logger.error(f"First chunk (embedding) failed: {result}")
+                    return
+                
+                # Now pipeline the remaining chunks (embedding file exists)
+                background_futures = []
+                for i in range(1, len(text_chunks)):
+                    chunk_wav = Path(f"/tmp/chunk_{request_id}_{i}.wav")
+                    temp_files.append(chunk_wav)
+                    future = await manager.submit_synthesis(
+                        text_chunks[i], str(chunk_wav), speaker, "", instruction or "", embedding
+                    )
+                    background_futures.append(future)
+                
+                for i, future in enumerate(background_futures):
+                    chunk_idx = i + 1
+                    chunk_wav = Path(f"/tmp/chunk_{request_id}_{chunk_idx}.wav")
+                    success, result = await future
+                    if success and chunk_wav.exists():
+                        mp3_data = await convert_wav_to_mp3(chunk_wav, apply_fades=True)
+                        yield mp3_data
+                    else:
+                        logger.error(f"Chunk {chunk_idx} failed: {result}")
+            else:
+                # Precomputed embedding or internal speaker: safe to pipeline everything
+                background_futures = []
+                for i in range(1, len(text_chunks)):
+                    chunk_wav = Path(f"/tmp/chunk_{request_id}_{i}.wav")
+                    temp_files.append(chunk_wav)
+                    future = await manager.submit_synthesis(
+                        text_chunks[i], str(chunk_wav), speaker, "", instruction or "", embedding
+                    )
+                    background_futures.append(future)
+                
+                # Await and stream chunk 0
+                success, result = await first_future
+                if success and first_wav.exists():
+                    mp3_data = await convert_wav_to_mp3(first_wav, apply_fades=True)
+                    yield mp3_data
+                else:
+                    logger.error(f"First chunk failed: {result}")
+                
+                # Stream the rest as they finish
+                for i, future in enumerate(background_futures):
+                    chunk_idx = i + 1
+                    chunk_wav = Path(f"/tmp/chunk_{request_id}_{chunk_idx}.wav")
+                    success, result = await future
+                    if success and chunk_wav.exists():
+                        mp3_data = await convert_wav_to_mp3(chunk_wav, apply_fades=True)
+                        yield mp3_data
+                    else:
+                        logger.error(f"Chunk {chunk_idx} failed: {result}")
                     
         finally:
             # Cleanup all temp files

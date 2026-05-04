@@ -3,3 +3,9 @@ uvicorn
 pydantic
 python-dotenv
 python-multipart
+langid
+pysbd
+gruut
+zh-normalization
+num2words
+clean-text
