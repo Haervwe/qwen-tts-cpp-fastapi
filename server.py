@@ -250,36 +250,6 @@ async def normalize_audio(input_path: Path, output_path: Path):
         print(f"FFmpeg Error: {stderr.decode()}")
         raise Exception(f"ffmpeg failed to normalize audio {input_path}")
 
-async def extract_embedding_and_synthesize(model_name: str, reference_wav: Path, output_json: Path, text: str, output_wav: Path, instruction: str = ""):
-    """Extract speaker embedding AND synthesize a chunk of audio in one go using the CLI."""
-    if not model_name.endswith(".gguf"):
-        model_name += ".gguf"
-        
-    cmd = [
-        str(CLI_PATH),
-        "-m", str(MODELS_BASE_DIR),
-        "--model-name", model_name,
-        "-r", str(reference_wav),
-        "--dump-speaker-embedding", str(output_json),
-        "-t", text,
-        "-o", str(output_wav)
-    ]
-    if instruction:
-        # Note: Using --instruction for the CLI
-        cmd.extend(["--instruction", instruction])
-    
-    print(f"Running embedding extraction + first chunk synthesis: {' '.join(cmd)}")
-    proc = await asyncio.create_subprocess_exec(
-        *cmd, 
-        stdout=asyncio.subprocess.PIPE, 
-        stderr=asyncio.subprocess.PIPE
-    )
-    stdout, stderr = await proc.communicate()
-    
-    if proc.returncode != 0:
-        print(f"Extraction/Synthesis Error: {stderr.decode()}")
-        raise Exception(f"Failed to extract/synthesize for {reference_wav}")
-
 def normalize_text(text: str) -> str:
     """Basic text normalization for TTS and sanitization for daemon protocol."""
     # Sanitize: remove newlines and pipes which break the daemon protocol
@@ -622,7 +592,6 @@ async def create_speech(req: SpeechRequest):
     request_id = uuid.uuid4().hex
     manager = await get_manager(model_name)
     temp_wavs = []
-    completed_chunks = {} # Store chunks already synthesized (e.g. chunk 0 during extraction)
     
     # Determine voice params once for all chunks
     speaker = ""
@@ -688,25 +657,12 @@ async def create_speech(req: SpeechRequest):
 
             if embed_cache_path.exists():
                 embedding = str(embed_cache_path)
+                reference = ""
             else:
-                # Optimized first-time generation:
-                # We use the CLI to synthesize the FIRST CHUNK and save the embedding simultaneously.
-                # This ensures the daemon starts with a ready embedding file for subsequent chunks.
-                print(f"Extracting embedding and synthesizing first chunk for {voice_name}...")
-                chunk0_text = text_chunks[0]
-                chunk0_wav = Path(f"/tmp/chunk_{request_id}_0.wav")
-                try:
-                    await extract_embedding_and_synthesize(
-                        model_name, processed_wav_path, embed_cache_path, 
-                        chunk0_text, chunk0_wav, instruction or ""
-                    )
-                    embedding = str(embed_cache_path)
-                    # Mark chunk 0 as already done
-                    completed_chunks[0] = chunk0_wav
-                except Exception as e:
-                    print(f"First chunk extraction/synthesis failed: {e}")
-                    # Fallback to normal behavior if extraction fails
-                    embedding = ""
+                # Trigger extraction on the first chunk of the batch
+                print(f"Extraction will be triggered on the first chunk for {voice_name}...")
+                reference = str(processed_wav_path)
+                embedding = str(embed_cache_path)
         else:
             # Fallback for non-base models or missing WAVs
             if info and info.get("speakers"):
@@ -722,34 +678,22 @@ async def create_speech(req: SpeechRequest):
             chunk_wav = Path(f"/tmp/chunk_{request_id}_{i}.wav")
             temp_wavs.append(chunk_wav)
             
-            # Skip chunks already handled (e.g. by extract_embedding_and_synthesize)
-            if i in completed_chunks:
-                continue
-                
             batch_requests.append({
                 'text': chunk,
                 'output': str(chunk_wav),
                 'speaker': speaker,
-                'reference': "", # We never need reference in the daemon anymore
+                'reference': reference if i == 0 else "", # Extract only on first chunk
                 'instruct': instruction or "",
                 'embedding': embedding,
             })
 
-        # Pipeline remaining chunks to the daemon
+        # Pipeline ALL chunks to the daemon
         if batch_requests:
             results = await manager.synthesize_batch(batch_requests)
             
-            # Map results back to our temp_wavs list
-            # synthesize_batch returns results in the same order as batch_requests
-            # but batch_requests might have different indices than text_chunks
-            req_idx = 0
-            for i in range(len(text_chunks)):
-                if i in completed_chunks:
-                    continue
-                success, result_path = results[req_idx]
+            for i, (success, result_path) in enumerate(results):
                 if not success:
                     print(f"Error synthesizing chunk {i}: {result_path}")
-                req_idx += 1
 
         successful_wavs = []
         for i, wav_path in enumerate(temp_wavs):
