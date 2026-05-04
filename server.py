@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Optional, List, Dict
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, UploadFile, File
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 from starlette.background import BackgroundTask
@@ -33,6 +33,11 @@ EMBED_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 # Default model if not specified
 DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "qwen3-tts-0.6b-f16.gguf")
+
+# Whisper Configuration
+WHISPER_CLI_PATH = Path(os.getenv("WHISPER_CLI_PATH", str(BASE_DIR / "whisper.cpp/build/bin/whisper-cli")))
+WHISPER_MODEL_PATH = Path(os.getenv("WHISPER_MODEL_PATH", "/mnt/data/models_storage/TTS/whisper/ggml-medium.bin"))
+TRANSCRIPT_CACHE_DIR = EMBED_CACHE_DIR # Reuse embed cache dir for transcripts
 
 # Cache for model info and speakers
 _model_cache = {}
@@ -78,6 +83,12 @@ class SpeechRequest(BaseModel):
     response_format: Optional[str] = "mp3"
     speed: Optional[float] = 1.0
     extra_body: Optional[dict] = {}
+
+class TranscriptionResponse(BaseModel):
+    text: str
+    task: Optional[str] = "transcribe"
+    language: Optional[str] = "english"
+    duration: Optional[float] = None
 
 # Load presets from presets.json
 PRESETS_FILE = Path(os.getenv("PRESETS_FILE", str(BASE_DIR / "presets.json")))
@@ -178,6 +189,36 @@ async def list_voices(model: Optional[str] = None):
         "object": "list"
     }
 
+@app.post("/v1/audio/transcriptions")
+async def transcribe_audio(
+    file: UploadFile = File(...),
+    model: Optional[str] = "whisper-1",
+    language: Optional[str] = "en",
+    prompt: Optional[str] = None,
+    response_format: Optional[str] = "json"
+):
+    """OpenAI-compatible transcription endpoint."""
+    temp_file = Path(f"/tmp/{uuid.uuid4()}_{file.filename}")
+    try:
+        # Save upload to temp file
+        with open(temp_file, "wb") as f:
+            f.write(await file.read())
+            
+        # Transcribe
+        text = await WhisperManager.transcribe(temp_file, language=language)
+        
+        if response_format == "text":
+            return text
+            
+        return TranscriptionResponse(text=text, language=language)
+        
+    except Exception as e:
+        print(f"Transcription error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        if temp_file.exists():
+            os.remove(temp_file)
+
 def get_file_sha256(file_path: Path):
     sha256_hash = hashlib.sha256()
     try:
@@ -189,8 +230,61 @@ def get_file_sha256(file_path: Path):
         print(f"Error hashing file {file_path}: {e}")
         return "unknown"
 
+async def normalize_audio(input_path: Path, output_path: Path):
+    """Normalize audio to 30s max, 24kHz, mono, normalized volume."""
+    cmd = [
+        "ffmpeg", "-i", str(input_path),
+        "-t", "30",              # Truncate to 30s
+        "-ar", "24000",          # 24kHz
+        "-ac", "1",              # Mono
+        "-af", "loudnorm",       # EBU R128 loudness normalization
+        str(output_path),
+        "-y"
+    ]
+    proc = await asyncio.create_subprocess_exec(
+        *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+    )
+    await proc.wait()
+    if proc.returncode != 0:
+        _, stderr = await proc.communicate()
+        print(f"FFmpeg Error: {stderr.decode()}")
+        raise Exception(f"ffmpeg failed to normalize audio {input_path}")
+
+async def extract_embedding_and_synthesize(model_name: str, reference_wav: Path, output_json: Path, text: str, output_wav: Path, instruction: str = ""):
+    """Extract speaker embedding AND synthesize a chunk of audio in one go using the CLI."""
+    if not model_name.endswith(".gguf"):
+        model_name += ".gguf"
+        
+    cmd = [
+        str(CLI_PATH),
+        "-m", str(MODELS_BASE_DIR),
+        "--model-name", model_name,
+        "-r", str(reference_wav),
+        "--dump-speaker-embedding", str(output_json),
+        "-t", text,
+        "-o", str(output_wav)
+    ]
+    if instruction:
+        # Note: Using --instruction for the CLI
+        cmd.extend(["--instruction", instruction])
+    
+    print(f"Running embedding extraction + first chunk synthesis: {' '.join(cmd)}")
+    proc = await asyncio.create_subprocess_exec(
+        *cmd, 
+        stdout=asyncio.subprocess.PIPE, 
+        stderr=asyncio.subprocess.PIPE
+    )
+    stdout, stderr = await proc.communicate()
+    
+    if proc.returncode != 0:
+        print(f"Extraction/Synthesis Error: {stderr.decode()}")
+        raise Exception(f"Failed to extract/synthesize for {reference_wav}")
+
 def normalize_text(text: str) -> str:
-    """Basic text normalization for TTS."""
+    """Basic text normalization for TTS and sanitization for daemon protocol."""
+    # Sanitize: remove newlines and pipes which break the daemon protocol
+    text = text.replace("\n", " ").replace("\r", " ").replace("|", " ")
+    
     abbreviations = {
         r"\bDr\.\b": "Doctor",
         r"\bMr\.\b": "Mister",
@@ -208,6 +302,49 @@ def normalize_text(text: str) -> str:
 
 managers: Dict[str, 'ModelManager'] = {}
 manager_lock = asyncio.Lock()
+
+class WhisperManager:
+    """Manages whisper-cli execution for transcription."""
+    
+    @staticmethod
+    async def transcribe(audio_path: Path, language: str = "en") -> str:
+        """Transcribe an audio file using whisper-cli."""
+        if not WHISPER_CLI_PATH.exists():
+            raise Exception(f"Whisper CLI not found at {WHISPER_CLI_PATH}")
+        if not WHISPER_MODEL_PATH.exists():
+            raise Exception(f"Whisper model not found at {WHISPER_MODEL_PATH}")
+
+        # Command to transcribe to stdout
+        cmd = [
+            str(WHISPER_CLI_PATH),
+            "-m", str(WHISPER_MODEL_PATH),
+            "-f", str(audio_path),
+            "-l", language,
+            "-nt",       # No timestamps
+            "-np",       # No prints (only the text)
+        ]
+        
+        print(f"Running Whisper transcription: {' '.join(cmd)}")
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        
+        stdout, stderr = await proc.communicate()
+        
+        if proc.returncode != 0:
+            error_msg = stderr.decode()
+            print(f"Whisper Error: {error_msg}")
+            raise Exception(f"Whisper failed with code {proc.returncode}")
+
+        text = stdout.decode().strip()
+        # Remove common Whisper artifacts like [Music], (silence), etc.
+        text = re.sub(r'\[.*?\]', '', text)
+        text = re.sub(r'\(.*?\)', '', text)
+        return text.strip()
+        
+        return ""
 
 class ModelManager:
     """Manages a persistent TTS daemon process with pipelined request handling.
@@ -484,6 +621,8 @@ async def create_speech(req: SpeechRequest):
 
     request_id = uuid.uuid4().hex
     manager = await get_manager(model_name)
+    temp_wavs = []
+    completed_chunks = {} # Store chunks already synthesized (e.g. chunk 0 during extraction)
     
     # Determine voice params once for all chunks
     speaker = ""
@@ -501,14 +640,73 @@ async def create_speech(req: SpeechRequest):
             wav_hash = get_file_sha256(reference_wav)
             # Use full model name to differentiate dimensions (0.6b vs 1.7b)
             embed_cache_path = EMBED_CACHE_DIR / f"{voice_name}_{model_name}_{wav_hash}.json"
+            transcript_cache_path = TRANSCRIPT_CACHE_DIR / f"{voice_name}_{wav_hash}.txt"
+            processed_wav_path = EMBED_CACHE_DIR / f"processed_{wav_hash}.wav"
             
+            # 1. Normalize audio (truncate to 30s, etc.)
+            if not processed_wav_path.exists():
+                print(f"Normalizing reference audio for {voice_name}...")
+                try:
+                    await normalize_audio(reference_wav, processed_wav_path)
+                except Exception as e:
+                    print(f"Audio normalization failed: {e}")
+                    # Fallback to original if normalization fails
+                    processed_wav_path = reference_wav
+            
+            # 2. Load or compute transcript (Full ICL requires transcript)
+            auto_transcript = ""
+            if transcript_cache_path.exists():
+                try:
+                    auto_transcript = transcript_cache_path.read_text().strip()
+                    print(f"Loaded cached transcript for {voice_name}")
+                except Exception as e:
+                    print(f"Error reading cached transcript: {e}")
+            
+            if not auto_transcript:
+                print(f"Transcribing reference audio for {voice_name}...")
+                try:
+                    # Always transcribe the processed (30s max) version
+                    auto_transcript = await WhisperManager.transcribe(processed_wav_path)
+                    if auto_transcript:
+                        transcript_cache_path.write_text(auto_transcript)
+                        print(f"Saved transcript to {transcript_cache_path}")
+                except Exception as e:
+                    print(f"Transcription failed: {e}")
+            
+            # 3. Combine auto transcript with user instruction
+            if auto_transcript:
+                # Sanitize: remove newlines and pipes which break the daemon protocol
+                auto_transcript = auto_transcript.replace("\n", " ").replace("\r", " ").replace("|", " ")
+                
+                # Note: Character-based truncation removed per user request. 
+                # We now rely on the 30s audio truncation above.
+                    
+                if instruction:
+                    instruction = f"{auto_transcript}. {instruction}"
+                else:
+                    instruction = auto_transcript
+
             if embed_cache_path.exists():
                 embedding = str(embed_cache_path)
             else:
-                # Extract embedding once for the first chunk and save to cache
-                print(f"Extracting new embedding for {voice_name} using {model_name}...")
-                reference = str(reference_wav)
-                embedding = str(embed_cache_path) 
+                # Optimized first-time generation:
+                # We use the CLI to synthesize the FIRST CHUNK and save the embedding simultaneously.
+                # This ensures the daemon starts with a ready embedding file for subsequent chunks.
+                print(f"Extracting embedding and synthesizing first chunk for {voice_name}...")
+                chunk0_text = text_chunks[0]
+                chunk0_wav = Path(f"/tmp/chunk_{request_id}_0.wav")
+                try:
+                    await extract_embedding_and_synthesize(
+                        model_name, processed_wav_path, embed_cache_path, 
+                        chunk0_text, chunk0_wav, instruction or ""
+                    )
+                    embedding = str(embed_cache_path)
+                    # Mark chunk 0 as already done
+                    completed_chunks[0] = chunk0_wav
+                except Exception as e:
+                    print(f"First chunk extraction/synthesis failed: {e}")
+                    # Fallback to normal behavior if extraction fails
+                    embedding = ""
         else:
             # Fallback for non-base models or missing WAVs
             if info and info.get("speakers"):
@@ -517,7 +715,6 @@ async def create_speech(req: SpeechRequest):
             else:
                 speaker = "vivian"
 
-    temp_wavs = []
     try:
         # Build all chunk requests upfront
         batch_requests = []
@@ -525,30 +722,39 @@ async def create_speech(req: SpeechRequest):
             chunk_wav = Path(f"/tmp/chunk_{request_id}_{i}.wav")
             temp_wavs.append(chunk_wav)
             
-            # For the first chunk, if we need to extract, we pass both reference and the target embedding path
-            # For subsequent chunks, we only pass the embedding path
-            current_reference = reference if i == 0 else ""
-            
+            # Skip chunks already handled (e.g. by extract_embedding_and_synthesize)
+            if i in completed_chunks:
+                continue
+                
             batch_requests.append({
                 'text': chunk,
                 'output': str(chunk_wav),
                 'speaker': speaker,
-                'reference': current_reference,
+                'reference': "", # We never need reference in the daemon anymore
                 'instruct': instruction or "",
                 'embedding': embedding,
             })
 
-        # Pipeline ALL chunks to the daemon at once — eliminates per-chunk
-        # IPC round-trip idle time. The daemon processes them back-to-back
-        # with zero GPU idle gap between chunks.
-        results = await manager.synthesize_batch(batch_requests)
+        # Pipeline remaining chunks to the daemon
+        if batch_requests:
+            results = await manager.synthesize_batch(batch_requests)
+            
+            # Map results back to our temp_wavs list
+            # synthesize_batch returns results in the same order as batch_requests
+            # but batch_requests might have different indices than text_chunks
+            req_idx = 0
+            for i in range(len(text_chunks)):
+                if i in completed_chunks:
+                    continue
+                success, result_path = results[req_idx]
+                if not success:
+                    print(f"Error synthesizing chunk {i}: {result_path}")
+                req_idx += 1
 
         successful_wavs = []
-        for i, (success, result_path) in enumerate(results):
-            if success and temp_wavs[i].exists():
-                successful_wavs.append(temp_wavs[i])
-            else:
-                print(f"Error synthesizing chunk {i}: {result_path}")
+        for i, wav_path in enumerate(temp_wavs):
+            if wav_path.exists():
+                successful_wavs.append(wav_path)
 
         if not successful_wavs:
             raise HTTPException(status_code=500, detail="Audio generation failed")
