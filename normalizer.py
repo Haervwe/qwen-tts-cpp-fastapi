@@ -139,7 +139,7 @@ class TextNormalizer:
                 text = "".join(self.zh_norm.normalize(text))
             except:
                 pass
-        # Note: gruut removed — Qwen3-TTS handles English abbreviations natively.
+        # Note: gruut removed — Qwen3-TTS handles Englhish abbreviations natively.
             
         return text, lang
     
