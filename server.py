@@ -555,7 +555,11 @@ class ModelManager:
             if not self.proc or self.proc.returncode is not None:
                 await self.start()
             
-            cmd_line = f"{text}|{output}|{speaker}|{reference}|{instruct}|{embedding}\n"
+            # Sanitize all fields: the daemon protocol is pipe-delimited, one command per line.
+            # Embedded newlines or pipes in any field would corrupt the protocol.
+            def _sanitize(s):
+                return s.replace("\n", " ").replace("\r", " ").replace("|", " ") if s else ""
+            cmd_line = f"{_sanitize(text)}|{output}|{_sanitize(speaker)}|{reference}|{_sanitize(instruct)}|{embedding}\n"
             logger.info(f"[{self.model_name}] → daemon: text=[{len(text)}c]{text[:50]}… ref={'Y' if reference else 'N'} inst=[{len(instruct)}c] emb={'Y' if embedding else 'N'}")
             self.proc.stdin.write(cmd_line.encode())
             await self.proc.stdin.drain()
