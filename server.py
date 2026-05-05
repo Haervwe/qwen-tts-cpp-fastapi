@@ -449,11 +449,14 @@ class ModelManager:
             ]
             
             logger.info(f"Starting model daemon: {' '.join(cmd)}")
+            daemon_env = os.environ.copy()
+            daemon_env["QWEN3_TTS_VOCODER_GPU"] = "1"  # GPU vocoder w/ HIP graph capture (~6.8x faster decode)
             self.proc = await asyncio.create_subprocess_exec(
                 *cmd,
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
+                stderr=asyncio.subprocess.PIPE,
+                env=daemon_env,
             )
             
             # Wait for READY
