@@ -5,7 +5,7 @@ import json
 import subprocess
 import hashlib
 import re
-import wave
+
 import io
 import logging
 from pathlib import Path
@@ -754,15 +754,15 @@ async def create_speech(req: SpeechRequest):
         needs_embedding_first = bool(reference)
         temp_files = []
         try:
-            # First chunk
+            # First chunk — daemon writes MP3 directly (native LAME encoding)
             first_text = text_chunks[0]
-            first_wav = Path(f"/tmp/chunk_{request_id}_0.wav")
-            temp_files.append(first_wav)
+            first_mp3 = Path(f"/tmp/chunk_{request_id}_0.mp3")
+            temp_files.append(first_mp3)
             
             # 1. Synthesize chunk 0
             logger.info(f"Synthesizing first chunk: {first_text[:30]}...")
             first_future = await manager.submit_synthesis(
-                first_text, str(first_wav), speaker, reference, instruction or "", embedding
+                first_text, str(first_mp3), speaker, reference, instruction or "", embedding
             )
             
             if needs_embedding_first:
@@ -772,9 +772,8 @@ async def create_speech(req: SpeechRequest):
                 logger.info("New voice clone — awaiting first chunk to compute embedding...")
                 success, result = await first_future
                 
-                if success and first_wav.exists():
-                    mp3_data = await convert_wav_to_mp3(first_wav, apply_fades=True)
-                    yield mp3_data
+                if success and first_mp3.exists():
+                    yield first_mp3.read_bytes()
                 else:
                     logger.error(f"First chunk (embedding) failed: {result}")
                     return
@@ -782,49 +781,46 @@ async def create_speech(req: SpeechRequest):
                 # Now pipeline the remaining chunks (embedding file exists)
                 background_futures = []
                 for i in range(1, len(text_chunks)):
-                    chunk_wav = Path(f"/tmp/chunk_{request_id}_{i}.wav")
-                    temp_files.append(chunk_wav)
+                    chunk_mp3 = Path(f"/tmp/chunk_{request_id}_{i}.mp3")
+                    temp_files.append(chunk_mp3)
                     future = await manager.submit_synthesis(
-                        text_chunks[i], str(chunk_wav), speaker, "", instruction or "", embedding
+                        text_chunks[i], str(chunk_mp3), speaker, "", instruction or "", embedding
                     )
                     background_futures.append(future)
                 
                 for i, future in enumerate(background_futures):
                     chunk_idx = i + 1
-                    chunk_wav = Path(f"/tmp/chunk_{request_id}_{chunk_idx}.wav")
+                    chunk_mp3 = Path(f"/tmp/chunk_{request_id}_{chunk_idx}.mp3")
                     success, result = await future
-                    if success and chunk_wav.exists():
-                        mp3_data = await convert_wav_to_mp3(chunk_wav, apply_fades=True)
-                        yield mp3_data
+                    if success and chunk_mp3.exists():
+                        yield chunk_mp3.read_bytes()
                     else:
                         logger.error(f"Chunk {chunk_idx} failed: {result}")
             else:
                 # Precomputed embedding or internal speaker: safe to pipeline everything
                 background_futures = []
                 for i in range(1, len(text_chunks)):
-                    chunk_wav = Path(f"/tmp/chunk_{request_id}_{i}.wav")
-                    temp_files.append(chunk_wav)
+                    chunk_mp3 = Path(f"/tmp/chunk_{request_id}_{i}.mp3")
+                    temp_files.append(chunk_mp3)
                     future = await manager.submit_synthesis(
-                        text_chunks[i], str(chunk_wav), speaker, "", instruction or "", embedding
+                        text_chunks[i], str(chunk_mp3), speaker, "", instruction or "", embedding
                     )
                     background_futures.append(future)
                 
                 # Await and stream chunk 0
                 success, result = await first_future
-                if success and first_wav.exists():
-                    mp3_data = await convert_wav_to_mp3(first_wav, apply_fades=True)
-                    yield mp3_data
+                if success and first_mp3.exists():
+                    yield first_mp3.read_bytes()
                 else:
                     logger.error(f"First chunk failed: {result}")
                 
                 # Stream the rest as they finish
                 for i, future in enumerate(background_futures):
                     chunk_idx = i + 1
-                    chunk_wav = Path(f"/tmp/chunk_{request_id}_{chunk_idx}.wav")
+                    chunk_mp3 = Path(f"/tmp/chunk_{request_id}_{chunk_idx}.mp3")
                     success, result = await future
-                    if success and chunk_wav.exists():
-                        mp3_data = await convert_wav_to_mp3(chunk_wav, apply_fades=True)
-                        yield mp3_data
+                    if success and chunk_mp3.exists():
+                        yield chunk_mp3.read_bytes()
                     else:
                         logger.error(f"Chunk {chunk_idx} failed: {result}")
                     
@@ -837,40 +833,7 @@ async def create_speech(req: SpeechRequest):
 
     return StreamingResponse(audio_generator(), media_type="audio/mpeg")
 
-async def convert_wav_to_mp3(wav_path: Path, apply_fades: bool = True) -> bytes:
-    """Convert WAV to MP3 and apply 5ms fades to prevent clicks between chunks."""
-    if not wav_path.exists():
-        return b""
-        
-    duration = 0.0
-    if apply_fades:
-        try:
-            # Get duration using ffprobe
-            probe_cmd = [
-                "ffprobe", "-v", "error", "-show_entries", "format=duration",
-                "-of", "default=noprint_wrappers=1:nokey=1", str(wav_path)
-            ]
-            proc = await asyncio.create_subprocess_exec(
-                *probe_cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL
-            )
-            stdout, _ = await proc.communicate()
-            duration = float(stdout.decode().strip())
-        except:
-            apply_fades = False
 
-    cmd = ["ffmpeg", "-i", str(wav_path)]
-    if apply_fades and duration > 0.01:
-        # Apply 5ms fade-in and 5ms fade-out
-        fade_out_start = max(0, duration - 0.005)
-        cmd.extend(["-af", f"afade=t=in:st=0:d=0.005,afade=t=out:st={fade_out_start}:d=0.005"])
-
-    cmd.extend(["-codec:a", "libmp3lame", "-qscale:a", "2", "-f", "mp3", "pipe:1"])
-    
-    proc = await asyncio.create_subprocess_exec(
-        *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL
-    )
-    stdout, _ = await proc.communicate()
-    return stdout
 
 if __name__ == "__main__":
     import uvicorn
