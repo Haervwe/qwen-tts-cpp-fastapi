@@ -559,9 +559,17 @@ class ModelManager:
                 await self.start()
             
             # Sanitize all fields: the daemon protocol is pipe-delimited, one command per line.
-            # Embedded newlines or pipes in any field would corrupt the protocol.
+            # Embedded pipes would corrupt the protocol.
+            # Newlines are encoded as literal '\n' so the daemon can decode them back —
+            # the model was trained with newlines as prosody/paragraph pause tokens.
             def _sanitize(s):
-                return s.replace("\n", " ").replace("\r", " ").replace("|", " ") if s else ""
+                if not s:
+                    return ""
+                s = s.replace("|", " ")       # pipes break protocol
+                s = s.replace("\r\n", "\\n")  # CRLF → escape
+                s = s.replace("\r", "\\n")    # stray CR → escape
+                s = s.replace("\n", "\\n")    # LF → escape (decoded by daemon)
+                return s
             cmd_line = f"{_sanitize(text)}|{output}|{_sanitize(speaker)}|{reference}|{_sanitize(instruct)}|{embedding}\n"
             logger.info(f"[{self.model_name}] → daemon: text=[{len(text)}c]{text[:50]}… ref={'Y' if reference else 'N'} inst=[{len(instruct)}c] emb={'Y' if embedding else 'N'}")
             self.proc.stdin.write(cmd_line.encode())
@@ -638,7 +646,7 @@ async def get_manager(model_name: str) -> ModelManager:
     return manager
 
 def split_text(text: str, lang: str = "en") -> List[str]:
-    return normalizer.split_sentences(text, lang)
+    return normalizer.chunk_for_tts(text, lang)
 
 @app.post("/v1/audio/speech")
 async def create_speech(req: SpeechRequest):
@@ -660,14 +668,14 @@ async def create_speech(req: SpeechRequest):
         if not instruction:
             instruction = preset.get("instruction")
 
-    # 2. Sentence-based splitting
-    text_chunks = normalizer.split_sentences(text, detected_lang)
+    # 2. Intelligent TTS chunking (paragraph-aware, sentence-merged)
+    text_chunks = normalizer.chunk_for_tts(text, detected_lang)
     if not text_chunks:
         raise HTTPException(status_code=400, detail="Empty input text")
 
-    logger.info(f"Input: {len(req.input)} chars → Normalized: {len(text)} chars → {len(text_chunks)} chunks (lang={detected_lang})")
+    logger.info(f"Input: {len(req.input)} chars → Normalized: {len(text)} chars → {len(text_chunks)} chunk(s) [{','.join(str(len(c)) for c in text_chunks)}c] (lang={detected_lang})")
     for i, chunk in enumerate(text_chunks):
-        logger.debug(f"  Chunk {i}: [{len(chunk)} chars] {chunk[:80]}...")
+        logger.info(f"  Chunk {i}/{len(text_chunks)-1}: [{len(chunk)}c] {chunk[:100]}{'…' if len(chunk)>100 else ''}")
 
     request_id = uuid.uuid4().hex
     manager = await get_manager(model_name)
